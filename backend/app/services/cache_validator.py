@@ -1,106 +1,18 @@
 import re
 from collections import Counter
-
-
 class CacheValidator:
-
-    NEGATIONS = {
-        "not", "never", "no", "without",
-        "cannot", "isn't", "aren't", "don't",
-        "doesn't", "won't", "can't"
-    }
-
-    VOLATILE_TERMS = {
-        "today", "tomorrow", "yesterday",
-        "latest", "current", "currently",
-        "now", "live", "recent", "tonight"
-    }
-
-    INTENT_GROUPS = {
-        "explanation": {
-            "what", "explain", "define", "describe"
-        },
-        "comparison": {
-            "compare", "difference", "versus", "vs"
-        },
-        "calculation": {
-            "calculate", "compute", "solve"
-        },
-        "implementation": {
-            "implement", "build", "create",
-            "write", "generate"
-        },
-        "troubleshooting": {
-            "debug", "fix", "error", "troubleshoot"
-        }
-    }
-
-    @staticmethod
-    def words(text):
-        text = text.lower().replace("\u2019", "'")
-
-        tokens = re.findall(r"\b[\w']+\b", text)
-
-        return {
-            token[:-2] if token.endswith("'s") else token
-            for token in tokens
-        }
-
-    @staticmethod
-    def numbers(text):
-        return Counter(
-            re.findall(
-                r"(?<!\d)[+-]?\d+(?:\.\d+)*%?",
-                text
-            )
-        )
-
-    def intent(self, text):
-        words = self.words(text)
-
-        return {
-            intent
-            for intent, keywords in self.INTENT_GROUPS.items()
-            if words & keywords
-        }
-
-    def cacheable(self, query):
-
-        words = self.words(query)
-
-        if words & self.VOLATILE_TERMS:
-            return False
-
-        return True
-
-    def validate(self, query, cached_query):
-
-        if not self.cacheable(query):
-            return False, "Time-sensitive query"
-
-        if not self.cacheable(cached_query):
-            return False, "Time-sensitive cached query"
-
-        if self.numbers(query) != self.numbers(cached_query):
-            return False, "Numerical mismatch"
-
-        query_negation = self.words(query) & self.NEGATIONS
-        cached_negation = self.words(cached_query) & self.NEGATIONS
-
-        if query_negation != cached_negation:
-            return False, "Negation mismatch"
-
-        query_intent = self.intent(query)
-        cached_intent = self.intent(cached_query)
-
-        if (
-            query_intent
-            and cached_intent
-            and query_intent.isdisjoint(cached_intent)
-        ):
-            return False, "Intent mismatch"
-
-        return True, "Validation passed"
-
-
-cache_validator = CacheValidator()
+    volatile={'today','tomorrow','yesterday','latest','current','currently','now','live','recent','tonight'}
+    negations={'not','never','no','without','cannot',"isn't","aren't","don't","doesn't","won't","can't"}
+    groups=[{'what','explain','define','describe'},{'compare','difference','versus','vs'},{'calculate','compute','solve'},{'implement','build','create','write','generate'},{'debug','fix','error','troubleshoot'}]
+    def words(self,text):
+        return {t[:-2] if t.endswith("'s") else t for t in re.findall(r"\b[\w']+\b",text.lower().replace('\u2019',"'"))}
+    def cacheable(self,query): return not bool(self.words(query)&self.volatile)
+    def validate(self,query,cached):
+        a,b=self.words(query),self.words(cached)
+        if not self.cacheable(query) or not self.cacheable(cached): return False,'Volatile query'
+        if Counter(re.findall(r'[+-]?\d+(?:\.\d+)*%?',query))!=Counter(re.findall(r'[+-]?\d+(?:\.\d+)*%?',cached)): return False,'Numerical mismatch'
+        if a&self.negations != b&self.negations: return False,'Negation mismatch'
+        x={i for i,g in enumerate(self.groups) if a&g}; y={i for i,g in enumerate(self.groups) if b&g}
+        if x and y and x.isdisjoint(y): return False,'Intent mismatch'
+        return True,'Validation passed'
+cache_validator=CacheValidator()

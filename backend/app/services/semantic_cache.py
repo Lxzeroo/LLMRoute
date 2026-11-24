@@ -1,210 +1,37 @@
-﻿import asyncio
+import asyncio
 import hashlib
-
 import numpy as np
-
 from app.core.config import settings
 from app.core.database import get_connection
 from app.services.embeddings import embedding_service
-
+from app.services.cache_validator import cache_validator
 
 class SemanticCache:
-
-    @staticmethod
-    def hash_query(query):
-        return hashlib.sha256(
-            query.strip().encode("utf-8")
-        ).hexdigest()
-
-    def exact_lookup(self, query, scope):
-
+    def find(self,query,scope,vector=None):
         with get_connection() as conn:
-
-            return conn.execute(
-                """
-                UPDATE semantic_cache
-                SET hit_count = hit_count + 1
-                WHERE query_hash = %s
-                AND scope = %s
-                AND embedding_model = %s
-                AND expires_at > NOW()
-                RETURNING query, answer, model
-                """,
-                (
-                    self.hash_query(query),
-                    scope,
-                    settings.embedding_model
-                )
-            ).fetchone()
-
-    def vector_lookup(self, vector, scope):
-
-        vector = np.asarray(vector, dtype=np.float32)
-
-        with get_connection() as conn:
-
-            result = conn.execute(
-                """
-                SELECT id, query, answer, model,
-                    1 - (embedding <=> %s) AS similarity
-                FROM semantic_cache
-                WHERE scope = %s
-                AND embedding_model = %s
-                AND expires_at > NOW()
-                ORDER BY embedding <=> %s
-                LIMIT 1
-                """,
-                (
-                    vector,
-                    scope,
-                    settings.embedding_model,
-                    vector
-                )
-            ).fetchone()
-
-            if (
-                result
-                and result["similarity"]
-                >= settings.cache_similarity_threshold
-            ):
-
-                conn.execute(
-                    """
-                    UPDATE semantic_cache
-                    SET hit_count = hit_count + 1
-                    WHERE id = %s
-                    """,
-                    (result["id"],)
-                )
-
-                return result
-
+            if vector is None:
+                rows=conn.execute('SELECT id, query, answer, model, 1.0 AS similarity FROM semantic_cache WHERE scope=%s AND query_hash=%s AND embedding_model=%s AND expires_at>now()', (scope,hashlib.sha256(query.encode()).hexdigest(),settings.embedding_model)).fetchall()
+            else:
+                v=np.asarray(vector,dtype=np.float32)
+                rows=conn.execute('SELECT id, query, answer, model, 1-(embedding <=> %s) AS similarity FROM semantic_cache WHERE scope=%s AND embedding_model=%s AND expires_at>now() ORDER BY embedding <=> %s LIMIT 5',(v,scope,settings.embedding_model,v)).fetchall()
+            for r in rows:
+                if r['similarity'] < settings.cache_similarity_threshold or not cache_validator.validate(query,r['query'])[0]: continue
+                conn.execute('UPDATE semantic_cache SET hit_count=hit_count+1 WHERE id=%s',(r['id'],))
+                return dict(cache_hit=True,cache_type='exact' if vector is None else 'semantic',answer=r['answer'],matched_query=r['query'],cached_model=r['model'],similarity=round(float(r['similarity']),4))
         return None
-
-    async def lookup(self, query, scope="default"):
-
-        exact = await asyncio.to_thread(
-            self.exact_lookup, query, scope
-        )
-
-        if exact:
-            return {
-                "cache_hit": True,
-                "cache_type": "exact",
-                "answer": exact["answer"],
-                "matched_query": exact["query"],
-                "cached_model": exact["model"],
-                "similarity": 1.0
-            }
-
-        vector = await embedding_service.embed(query)
-
-        similar = await asyncio.to_thread(
-            self.vector_lookup, vector, scope
-        )
-
-        if similar:
-            return {
-                "cache_hit": True,
-                "cache_type": "semantic",
-                "answer": similar["answer"],
-                "matched_query": similar["query"],
-                "cached_model": similar["model"],
-                "similarity": round(
-                    float(similar["similarity"]), 4
-                )
-            }
-
-        return {
-            "cache_hit": False,
-            "cache_type": None,
-            "embedding": vector
-        }
-
-    def store(
-        self, query, answer, embedding,
-        scope="default", model=None
-    ):
-
-        vector = np.asarray(
-            embedding, dtype=np.float32
-        )
-
+    async def lookup(self,query,scope='default'):
+        if not cache_validator.cacheable(query): return dict(cache_hit=False,embedding=None,cache_bypass=True)
+        exact=await asyncio.to_thread(self.find,query,scope)
+        if exact: return exact
+        vector=await embedding_service.embed(query)
+        return await asyncio.to_thread(self.find,query,scope,vector) or dict(cache_hit=False,embedding=vector)
+    def store(self,query,answer,embedding,scope='default',model=None):
+        if embedding is None: return
         with get_connection() as conn:
-
-            conn.execute(
-                """
-                INSERT INTO semantic_cache (
-                    query_hash, query, answer,
-                    embedding, scope, embedding_model,
-                    model, expires_at
-                )
-                VALUES (
-                    %s, %s, %s, %s, %s, %s, %s,
-                    NOW() + (%s * INTERVAL '1 second')
-                )
-                ON CONFLICT (
-                    scope, query_hash, embedding_model
-                )
-                DO UPDATE SET
-                    answer = EXCLUDED.answer,
-                    embedding = EXCLUDED.embedding,
-                    model = EXCLUDED.model,
-                    created_at = NOW(),
-                    expires_at = EXCLUDED.expires_at
-                """,
-                (
-                    self.hash_query(query),
-                    query,
-                    answer,
-                    vector,
-                    scope,
-                    settings.embedding_model,
-                    model,
-                    settings.cache_ttl_seconds
-                )
-            )
-
+            conn.execute('''INSERT INTO semantic_cache(query_hash,query,answer,embedding,scope,embedding_model,model,expires_at) VALUES (%s,%s,%s,%s,%s,%s,%s,now()+%s*interval '1 second') ON CONFLICT(scope,query_hash,embedding_model) DO UPDATE SET answer=excluded.answer,embedding=excluded.embedding,model=excluded.model,expires_at=excluded.expires_at,created_at=now()''',(hashlib.sha256(query.encode()).hexdigest(),query,answer,np.asarray(embedding,dtype=np.float32),scope,settings.embedding_model,model,settings.cache_ttl_seconds))
     def stats(self):
-
-        with get_connection() as conn:
-
-            cache = conn.execute(
-                """
-                SELECT COUNT(*) AS entries
-                FROM semantic_cache
-                WHERE expires_at > NOW()
-                """
-            ).fetchone()
-
-            metrics = conn.execute(
-                """
-                SELECT
-                    COUNT(*) AS total_requests,
-                    COUNT(*) FILTER (
-                        WHERE cache_hit
-                    ) AS hits,
-                    COUNT(*) FILTER (
-                        WHERE NOT cache_hit
-                    ) AS misses
-                FROM request_metrics
-                """
-            ).fetchone()
-
-        total = metrics["total_requests"]
-
-        return {
-            **cache,
-            **metrics,
-            "hit_rate": round(
-                metrics["hits"] / total * 100, 2
-            ) if total else 0.0
-        }
-
-    def clear(self):
-
-        with get_connection() as conn:
-            conn.execute("DELETE FROM semantic_cache")
-
-
-semantic_cache = SemanticCache()
+        from app.services.analytics import analytics_service
+        r=analytics_service.summary()
+        with get_connection() as conn: n=conn.execute('SELECT count(*) AS entries FROM semantic_cache WHERE expires_at>now()').fetchone()['entries']
+        return dict(entries=n,hits=r['exact_hits']+r['semantic_hits'],misses=r['llm_calls'],total_requests=r['total_requests'],hit_rate=r['cache_hit_rate'])
+semantic_cache=SemanticCache()

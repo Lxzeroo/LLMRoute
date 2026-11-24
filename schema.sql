@@ -1,0 +1,12 @@
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE IF NOT EXISTS semantic_cache(id BIGSERIAL PRIMARY KEY,query_hash VARCHAR(64) NOT NULL,query TEXT NOT NULL,answer TEXT NOT NULL,embedding VECTOR(384) NOT NULL,scope VARCHAR(255) NOT NULL DEFAULT 'default',embedding_model VARCHAR(100) NOT NULL,model VARCHAR(100),created_at TIMESTAMPTZ NOT NULL DEFAULT now(),expires_at TIMESTAMPTZ NOT NULL,hit_count BIGINT NOT NULL DEFAULT 0,UNIQUE(scope,query_hash,embedding_model));
+CREATE INDEX IF NOT EXISTS idx_cache_embedding ON semantic_cache USING hnsw(embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_cache_expiry ON semantic_cache(expires_at);
+CREATE TABLE IF NOT EXISTS request_metrics(id BIGSERIAL PRIMARY KEY,query TEXT NOT NULL,model VARCHAR(100),source VARCHAR(30) NOT NULL,cache_hit BOOLEAN NOT NULL DEFAULT FALSE,similarity DOUBLE PRECISION,latency_ms DOUBLE PRECISION NOT NULL,inference_ms DOUBLE PRECISION DEFAULT 0,input_tokens INTEGER DEFAULT 0,output_tokens INTEGER DEFAULT 0,complexity_score DOUBLE PRECISION,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+ALTER TABLE request_metrics ADD COLUMN IF NOT EXISTS routing_mode VARCHAR(20),ADD COLUMN IF NOT EXISTS estimated_cost_usd DOUBLE PRECISION,ADD COLUMN IF NOT EXISTS baseline_cost_usd DOUBLE PRECISION,ADD COLUMN IF NOT EXISTS estimated_savings_usd DOUBLE PRECISION,ADD COLUMN IF NOT EXISTS budget_usd DOUBLE PRECISION;
+CREATE INDEX IF NOT EXISTS idx_metrics_created ON request_metrics(created_at);
+CREATE TABLE IF NOT EXISTS documents(id UUID PRIMARY KEY,filename VARCHAR(255) NOT NULL,file_hash VARCHAR(64) NOT NULL,file_size BIGINT NOT NULL,page_count INTEGER NOT NULL,chunk_count INTEGER NOT NULL DEFAULT 0,embedding_model VARCHAR(100) NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS document_chunks(id BIGSERIAL PRIMARY KEY,document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,chunk_index INTEGER NOT NULL,page_number INTEGER NOT NULL,content TEXT NOT NULL,embedding VECTOR(384) NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),UNIQUE(document_id,chunk_index));
+CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(file_hash);
+CREATE INDEX IF NOT EXISTS idx_chunks_document ON document_chunks(document_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON document_chunks USING hnsw(embedding vector_cosine_ops);
