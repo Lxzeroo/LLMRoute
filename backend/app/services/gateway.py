@@ -5,24 +5,30 @@ from app.core.config import settings
 from app.services.semantic_cache import semantic_cache
 from app.services.model_router import model_router
 from app.services.inference import inference_service
-from app.services.analytics import analytics_service
+from app.services.cost_engine import cost_engine
+from app.services.cost_analytics import cost_analytics
 
 
 class LLMGateway:
 
     def __init__(self):
-
         self.semaphore = asyncio.Semaphore(
             settings.max_concurrent_requests
         )
 
-    async def process(self, query: str) -> dict:
+    async def process(
+        self, query, mode="balanced", budget=None
+    ):
 
         start = time.perf_counter()
 
+        scope = f"v2:{mode}:{budget}"
+
         async with self.semaphore:
 
-            cached = await semantic_cache.lookup(query)
+            cached = await semantic_cache.lookup(
+                query, scope=scope
+            )
 
             if cached["cache_hit"]:
 
@@ -45,7 +51,9 @@ class LLMGateway:
 
             else:
 
-                routing = model_router.route(query)
+                routing = model_router.route(
+                    query, mode, budget
+                )
 
                 inference = await inference_service.generate(
                     query, routing["model"]
@@ -58,6 +66,7 @@ class LLMGateway:
                         query,
                         inference["answer"],
                         cached["embedding"],
+                        scope=scope,
                         model=routing["model"]
                     )
 
@@ -70,16 +79,28 @@ class LLMGateway:
                     "routing": routing
                 }
 
+            result["mode"] = mode
+            result["budget_usd"] = budget
+
+            result["cost"] = cost_engine.evaluate(result)
+
+            result["budget_exceeded"] = (
+                budget is not None
+                and result["cost"]["estimated_cost_usd"] > budget
+            )
+
             result["latency_ms"] = round(
-                (time.perf_counter() - start) * 1000, 2
+                (time.perf_counter() - start) * 1000,
+                2
             )
 
             await asyncio.to_thread(
-                analytics_service.record, result
+                cost_analytics.record, result
             )
 
             result["total_processing_ms"] = round(
-                (time.perf_counter() - start) * 1000, 2
+                (time.perf_counter() - start) * 1000,
+                2
             )
 
             return result
